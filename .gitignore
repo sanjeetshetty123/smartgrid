@@ -1,0 +1,24 @@
+# ── Python ────────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.log
+telemetry_log.csv
+
+# ── Node / React (smart-grid-dashboard) ─────────────────────────────────────
+node_modules/
+/smart-grid-dashboard/build
+.pnp
+.pnp.js
+/smart-grid-dashboard/coverage
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.vercel
+
+# ── Misc ─────────────────────────────────────────────────────────────────
+.DS_Store
+.dashboard-git-backup/

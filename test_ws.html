@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>MQTT WebSocket Bridge Test</title>
+<script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+<style>
+  body { font-family: monospace; background: #111; color: #0f0; padding: 1rem; }
+  #status { font-weight: bold; margin-bottom: 1rem; }
+  #status.connecting { color: #ff0; }
+  #status.connected { color: #0f0; }
+  #status.error { color: #f33; }
+  #log { white-space: pre-wrap; font-size: 0.9rem; }
+  .line { border-bottom: 1px solid #333; padding: 2px 0; }
+  .topic { color: #6cf; }
+</style>
+</head>
+<body>
+<div id="status" class="connecting">Connecting to ws://localhost:9001/mqtt ...</div>
+<div id="log"></div>
+
+<script>
+  const BROKER_URL = "ws://localhost:9001/mqtt";
+  const TOPIC = "home1/#";
+
+  const statusEl = document.getElementById("status");
+  const logEl = document.getElementById("log");
+
+  function logLine(text) {
+    const div = document.createElement("div");
+    div.className = "line";
+    div.textContent = text;
+    logEl.prepend(div);
+  }
+
+  const client = mqtt.connect(BROKER_URL, {
+    connectTimeout: 5000,
+    reconnectPeriod: 2000,
+  });
+
+  client.on("connect", () => {
+    statusEl.textContent = "CONNECTED to " + BROKER_URL;
+    statusEl.className = "connected";
+    client.subscribe(TOPIC, (err) => {
+      if (err) {
+        logLine("SUBSCRIBE ERROR: " + err.message);
+      } else {
+        logLine("Subscribed to " + TOPIC + " - waiting for messages...");
+      }
+    });
+  });
+
+  client.on("message", (topic, payload) => {
+    const ts = new Date().toLocaleTimeString();
+    logLine(`[${ts}] ${topic} : ${payload.toString()}`);
+  });
+
+  client.on("error", (err) => {
+    statusEl.textContent = "ERROR: " + err.message;
+    statusEl.className = "error";
+    logLine("ERROR EVENT: " + err.message);
+  });
+
+  client.on("reconnect", () => {
+    statusEl.textContent = "Reconnecting to " + BROKER_URL + " ...";
+    statusEl.className = "connecting";
+  });
+
+  client.on("close", () => {
+    statusEl.textContent = "Connection closed.";
+    statusEl.className = "error";
+  });
+</script>
+</body>
+</html>
