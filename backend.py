@@ -1,10 +1,10 @@
 """
-GridMind Backend v2.1 - protection brain + Telegram alerts + per-load LCD status
+GridMind Backend v2.2 - protection brain + Twilio Voice Call alerts + per-load LCD status
 Watches all telemetry (real + virtual), automatically:
   - detects overload faults per load -> trips that load only
   - detects overvoltage -> sheds low-priority loads first
   - feeds the ESP32's LCD with live totals AND per-load ON/OFF status
-  - sends every alert to your phone via Telegram
+  - triggers automated emergency voice call alerts to your phone via Twilio
   - logs everything to telemetry_log.csv for ML training
 
 Run:  python backend.py     (with broker + virtual house already running)
@@ -13,20 +13,49 @@ Run:  python backend.py     (with broker + virtual house already running)
 import csv
 import json
 import os
+import sys
 import threading
 import time
-import urllib.parse
-import urllib.request
+
+# Ensure UTF-8 output if supported
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 import paho.mqtt.client as mqtt
+
+try:
+    from twilio.rest import Client as TwilioClient
+    TWILIO_AVAILABLE = True
+except ImportError:
+    TWILIO_AVAILABLE = False
 
 BROKER = "localhost"
 PORT = 1883
 
-# ======== set these as environment variables (same values that worked in test_telegram.py) ========
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "PASTE_YOUR_TELEGRAM_TOKEN_HERE")
-TELEGRAM_CHAT_IDS = [c for c in os.environ.get("TELEGRAM_CHAT_IDS", "").split(",") if c] or ["PASTE_YOUR_CHAT_ID"]
-# =====================================================================================================
+# ======== Twilio Voice Call Settings ========
+TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "AC86d18a00ece430acd64bbf0bb66fa96b")
+TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "6e16975d0fb2ec5a7476a26272407cfe")
+TWILIO_PHONE_NUMBER = os.environ.get("TWILIO_PHONE_NUMBER", "+16318007291")
+
+raw_to_numbers = os.environ.get("TWILIO_TO_PHONE_NUMBER", "") or os.environ.get("ALERT_PHONE_NUMBER", "")
+TWILIO_TO_PHONE_NUMBERS = [n.strip() for n in raw_to_numbers.split(",") if n.strip()]
+
+twilio_client = None
+if TWILIO_AVAILABLE and TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
+    try:
+        twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    except Exception as e:
+        print(f"Failed to initialize Twilio: {e}")
+# ============================================
 
 # ---------------- Protection settings ----------------
 POWER_LIMITS = {"fan": 150, "ac": 2000, "washer": 2500}
@@ -43,33 +72,66 @@ shed = []
 overvolt_active = False
 last_summary = 0
 
+last_call_time = 0
+CALL_COOLDOWN_SECONDS = 30  # Debounce: avoid placing calls more than once every 30s
+
 
 def now():
     return time.strftime("%H:%M:%S")
 
 
-# ---------------- Telegram ----------------
+# ---------------- Twilio Voice Alerts ----------------
 
-def send_telegram(msg):
-    if "PASTE_YOUR" in TELEGRAM_TOKEN:
-        print(f"[{now()}] (Telegram not configured - skipping)")
+def trigger_voice_call(msg, detail=""):
+    """Initiates an automated emergency voice phone call via Twilio."""
+    global last_call_time
+    now_ts = time.time()
+    if now_ts - last_call_time < CALL_COOLDOWN_SECONDS:
+        print(f"[{now()}] Voice call cooldown active ({int(CALL_COOLDOWN_SECONDS - (now_ts - last_call_time))}s left) - skipping duplicate call")
         return
-    for chat_id in TELEGRAM_CHAT_IDS:
-        url = (f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage?"
-               f"chat_id={chat_id}&text=" + urllib.parse.quote(msg))
+
+    if not twilio_client:
+        print(f"[{now()}] (Twilio client not initialized or SDK missing - skipping voice call)")
+        return
+
+    if not TWILIO_TO_PHONE_NUMBERS:
+        print(f"[{now()}] (Twilio voice alert not dispatched: TWILIO_TO_PHONE_NUMBER not set in .env)")
+        return
+
+    # Clean text for TwiML voice synthesis
+    spoken_text = f"Attention. GridMind Emergency Alert. {msg}. {detail}. Please check your microgrid system immediately."
+    spoken_text = spoken_text.replace("&", "and").replace("<", "").replace(">", "").replace('"', "")
+
+    twiml = (
+        f"<Response>"
+        f"<Say voice=\"alice\" loop=\"2\">"
+        f"{spoken_text}"
+        f"</Say>"
+        f"<Pause length=\"1\"/>"
+        f"<Say voice=\"alice\">Repeating alert. {msg}.</Say>"
+        f"</Response>"
+    )
+
+    last_call_time = now_ts
+    for to_number in TWILIO_TO_PHONE_NUMBERS:
         try:
-            urllib.request.urlopen(url, timeout=10)
-            print(f"[{now()}] Telegram sent to {chat_id}")
+            # Ensure number starts with +
+            dest = to_number if to_number.startswith("+") else ("+91" + to_number if len(to_number) == 10 else "+" + to_number)
+            call = twilio_client.calls.create(
+                twiml=twiml,
+                to=dest,
+                from_=TWILIO_PHONE_NUMBER
+            )
+            print(f"[{now()}] [CALL] Twilio voice call initiated to {dest} (Call SID: {call.sid})")
         except Exception as e:
-            print(f"[{now()}] Telegram FAILED for {chat_id}: {e}")
+            print(f"[{now()}] [ERROR] Twilio voice call FAILED to {to_number}: {e}")
 
 
 def alert(client, msg, detail=""):
-    """Alert -> real buzzer + LCD + console + Telegram phone message."""
+    """Alert -> real buzzer + LCD + console + Twilio phone voice call."""
     print(f"[{now()}] *** ALERT: {msg}")
     client.publish("home1/alerts", msg)            # short: fits the 16x2 LCD
-    full = f"⚡ GridMind Alert\n{msg}\n{detail}\nTime: {now()}"
-    threading.Thread(target=send_telegram, args=(full,), daemon=True).start()
+    threading.Thread(target=trigger_voice_call, args=(msg, detail), daemon=True).start()
 
 
 # ---------------- CSV logging ----------------
@@ -185,8 +247,10 @@ def main():
     client.on_message = on_message
     client.connect(BROKER, PORT, 60)
     client.loop_start()
-    print("Backend brain v2.1 running (with Telegram + LCD load status). Watching all loads...\n")
-    send_telegram("✅ GridMind backend started at " + now())
+    
+    print("Backend brain v2.2 running (with Twilio Voice Call Alerts + LCD load status). Watching all loads...")
+    dest_str = ', '.join(TWILIO_TO_PHONE_NUMBERS) if TWILIO_TO_PHONE_NUMBERS else '[Set TWILIO_TO_PHONE_NUMBER in .env]'
+    print(f"[{now()}] Twilio Voice Alerts armed: From {TWILIO_PHONE_NUMBER} -> To {dest_str}\n")
 
     while True:
         time.sleep(0.2)
